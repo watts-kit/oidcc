@@ -3,11 +3,13 @@
 -export([add_openid_provider/2]).
 -export([add_openid_provider/3]).
 -export([find_openid_provider/1]).
+-export([find_all_openid_provider/1]).
 -export([get_openid_provider_info/1]).
 -export([get_openid_provider_list/0]).
 -export([create_redirect_url/1]).
 -export([create_redirect_url/2]).
 -export([create_redirect_for_session/1]).
+-export([create_redirect_for_session/2]).
 -export([retrieve_and_validate_token/2]).
 -export([retrieve_and_validate_token/3]).
 -export([retrieve_user_info/2]).
@@ -37,6 +39,7 @@ add_openid_provider(IssuerOrConfigEP, LocalEndpoint, AdditionalConfig) ->
                     client_id => undefined,
                     client_secret => <<"">>,
                     request_scopes => undefined,
+                    static_extend_url => #{},
                     registration_params => #{}
                    },
     ForceUpdate = #{ issuer_or_endpoint => IssuerOrConfigEP,
@@ -53,6 +56,11 @@ add_openid_provider(IssuerOrConfigEP, LocalEndpoint, AdditionalConfig) ->
                                                     | {error, not_found}.
 find_openid_provider(Issuer) ->
     oidcc_openid_provider_mgr:find_openid_provider(Issuer).
+
+-spec find_all_openid_provider(Issuer::binary()) -> {ok, [pid()]}
+                                                    | {error, not_found}.
+find_all_openid_provider(Issuer) ->
+    oidcc_openid_provider_mgr:find_all_openid_provider(Issuer).
 
 %% @doc
 %% get information from a given OpenId Connect Provider
@@ -90,12 +98,21 @@ get_openid_provider_list() ->
 %% @end
 -spec create_redirect_for_session(pid()) -> {ok, binary()}.
 create_redirect_for_session(Session) ->
+    create_redirect_for_session(Session, #{}).
+
+%% @doc
+%% same as create_redirect_url/4 but with all parameters being fetched
+%% from the given session, except the provider
+%% @end
+-spec create_redirect_for_session(pid(), map()) -> {ok, binary()}.
+create_redirect_for_session(Session, UrlExtension) ->
     {ok, Scopes} = oidcc_session:get_scopes(Session),
     {ok, State} = oidcc_session:get_id(Session),
     {ok, Nonce} = oidcc_session:get_nonce(Session),
     {ok, Pkce} = oidcc_session:get_pkce(Session),
     {ok, OpenIdProviderId} = oidcc_session:get_provider(Session),
-    Config = #{scopes => Scopes, state => State, nonce => Nonce, pkce => Pkce},
+    Config = #{scopes => Scopes, state => State, nonce => Nonce, pkce => Pkce,
+              url_extension => UrlExtension},
     create_redirect_url(OpenIdProviderId, Config).
 
 %% @doc
@@ -117,7 +134,8 @@ create_redirect_url(OpenIdProviderId, Config) ->
       scopes => [openid],
       state => undefined,
       nonce => undefined,
-      pkce => undefined
+      pkce => undefined,
+      url_extension => #{}
      },
     {ok, Info} = get_openid_provider_info(OpenIdProviderId),
     create_redirect_url_if_ready(Info, maps:merge(BasicConfig, Config)).
@@ -279,19 +297,22 @@ create_redirect_url_if_ready(#{ready := false}, _) ->
 create_redirect_url_if_ready(Info, Config) ->
     #{ local_endpoint := LocalEndpoint,
        client_id := ClientId,
-       authorization_endpoint := AuthEndpoint
+       authorization_endpoint := AuthEndpoint,
+       static_extend_url := StaticUrlKeyValues
      } = Info,
     #{
        scopes := Scopes,
        state := OidcState,
        nonce := OidcNonce,
-       pkce := Pkce
+       pkce := Pkce,
+       url_extension := DynUrlKeyValues
      } = Config,
+    UrlKeyValues = maps:merge(StaticUrlKeyValues, DynUrlKeyValues),
     UrlList = [
                {<<"response_type">>, <<"code">>},
                {<<"client_id">>, ClientId},
                {<<"redirect_uri">>, LocalEndpoint}
-              ],
+              ] ++ map_to_url_list(UrlKeyValues),
     UrlList1 = append_state(OidcState, UrlList),
     UrlList2 = append_nonce(OidcNonce, UrlList1),
     UrlList3 = append_code_challenge(Pkce, UrlList2),
@@ -299,6 +320,29 @@ create_redirect_url_if_ready(Info, Config) ->
     Qs = oidcc_http_util:qs(UrlList4),
     Url = << AuthEndpoint/binary, <<"?">>/binary, Qs/binary>>,
     {ok, Url}.
+
+map_to_url_list(Map) when is_map(Map) ->
+    ConvertValue = fun(Value) when is_binary(Value) ->
+                           Value;
+                      (Atom) when is_atom(Atom) ->
+                           atom_to_binary(Atom, utf8);
+                      (List) when is_list(List) ->
+                           list_to_binary(List);
+                      (_Other) ->
+                           undefined
+                   end,
+    Convert = fun({Key, Value}, List) ->
+                      CKey = ConvertValue(Key),
+                      CValue = ConvertValue(Value),
+                      case (CKey /= undefined) and (CValue /= undefined) of
+                          true ->
+                              [{CKey, CValue} | List];
+                          _ ->
+                              List
+                      end
+              end,
+    lists:foldl(Convert, [], maps:to_list(Map)).
+
 
 
 append_scope(<<>>, QsList) ->
